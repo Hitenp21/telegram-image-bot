@@ -10,7 +10,7 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // Gemini REST endpoint — avoids SDK fetch issues in serverless environments
 const GEMINI_URL =
-  `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 // chatId → { rows: [], processing: number, albumTimeouts: Map }
@@ -99,10 +99,18 @@ async function extractFromImage(buffer, filePath) {
     },
   };
 
-  const response = await axios.post(GEMINI_URL, requestBody, {
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 60000,  // 60 s for large bill images
-  });
+  let response;
+  try {
+    response = await axios.post(GEMINI_URL, requestBody, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 60000,  // 60 s for large bill images
+    });
+  } catch (apiErr) {
+    // Log the full Gemini error body so you can diagnose API issues
+    const status = apiErr?.response?.status;
+    const body   = JSON.stringify(apiErr?.response?.data || apiErr.message);
+    throw new Error(`Gemini API ${status}: ${body}`);
+  }
 
   // Navigate the Gemini REST response structure
   const raw = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
