@@ -378,14 +378,18 @@ bot.on('photo', async ctx => {
 
 // ─── Vercel Webhook Adapter ────────────────────────────────────────────────────
 module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    return res.status(200).send('Bill Extractor Bot is running ✅');
+  }
+
+  // ⚡ Respond to Telegram IMMEDIATELY — prevents socket hang up on slow processing
+  // Telegram retries if it doesn't get 200 within ~5s, so we must reply first
+  res.status(200).send('OK');
+
+  // Process the update in the background AFTER the response is sent
   try {
-    if (req.method === 'POST') {
-      await bot.handleUpdate(req.body);
-      return res.status(200).send('OK');
-    }
-    res.status(200).send('Bill Extractor Bot is running ✅');
+    await bot.handleUpdate(req.body);
   } catch (err) {
-    console.error('Webhook error:', err.message);
-    res.status(500).send('Internal Error');
+    console.error('Webhook processing error:', err.message);
   }
 };
