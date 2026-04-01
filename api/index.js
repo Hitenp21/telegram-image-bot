@@ -8,9 +8,9 @@ const path = require('path');
 // ─── Init ─────────────────────────────────────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Gemini REST endpoint — avoids SDK fetch issues in serverless environments
-const GEMINI_URL =
-  `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent?key=${process.env.GEMINI_API_KEY}`;
+// Groq API — free tier, fast, supports Llama vision (get key at console.groq.com)
+const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL = 'llama-3.2-11b-vision-preview'; // free, 30 req/min, 1000 req/day
 
 // ─── State ────────────────────────────────────────────────────────────────────
 // chatId → { rows: [], processing: number, albumTimeouts: Map }
@@ -78,60 +78,56 @@ async function downloadTelegramFile(fileId) {
 async function extractFromImage(buffer, filePath) {
   const mimeType = getMimeType(filePath);
 
-  // Build REST request body — avoids SDK fetch issues in serverless environments
+  // Build Groq request — OpenAI-compatible format with base64 vision
+  const base64Url = `data:${mimeType};base64,${buffer.toString('base64')}`;
   const requestBody = {
-    contents: [
+    model: GROQ_MODEL,
+    temperature: 0.1,
+    max_tokens: 2048,
+    messages: [
       {
-        parts: [
-          { text: BILL_PROMPT },
-          {
-            inline_data: {
-              mime_type: mimeType,
-              data: buffer.toString('base64'),
-            },
-          },
+        role: 'user',
+        content: [
+          { type: 'text',      text: BILL_PROMPT },
+          { type: 'image_url', image_url: { url: base64Url } },
         ],
       },
     ],
-    generationConfig: {
-      temperature: 0.1,      // low temp = deterministic JSON
-      maxOutputTokens: 2048,
-    },
   };
 
-  // Retry up to 3 times on 429 (rate limit), with delay from Retry-After header
+  // Retry up to 3 times on 429 rate-limit
   let response;
   const MAX_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      response = await axios.post(GEMINI_URL, requestBody, {
-        headers: { 'Content-Type': 'application/json' },
+      response = await axios.post(GROQ_URL, requestBody, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        },
         timeout: 60000,
       });
-      break; // success — exit retry loop
+      break;
     } catch (apiErr) {
-      const status = apiErr?.response?.status;
-      const errBody = apiErr?.response?.data?.error;
+      const status  = apiErr?.response?.status;
+      const errBody = apiErr?.response?.data;
 
       if (status === 429 && attempt < MAX_RETRIES) {
-        // Parse retry delay from Gemini error details (e.g. "15s")
-        const retryDetail = errBody?.details?.find(d => d['@type']?.includes('RetryInfo'));
-        const delaySecs   = parseInt(retryDetail?.retryDelay) || (attempt * 15);
-        console.log(`Gemini 429 — waiting ${delaySecs}s before retry ${attempt}/${MAX_RETRIES}`);
-        await new Promise(r => setTimeout(r, delaySecs * 1000));
+        // Groq returns Retry-After header in seconds
+        const retryAfter = parseInt(apiErr.response?.headers?.['retry-after']) || (attempt * 20);
+        console.log(`Groq 429 — waiting ${retryAfter}s before retry ${attempt}/${MAX_RETRIES}`);
+        await new Promise(r => setTimeout(r, retryAfter * 1000));
         continue;
       }
 
-      // Non-429 or out of retries — throw with full detail
-      const body = JSON.stringify(errBody || apiErr.message);
-      throw new Error(`Gemini API ${status}: ${body}`);
+      throw new Error(`Groq API ${status}: ${JSON.stringify(errBody || apiErr.message)}`);
     }
   }
 
-  // Navigate the Gemini REST response structure
-  const raw = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-  if (!raw) throw new Error('Empty response from Gemini REST API');
-  console.log('Gemini raw:', raw.substring(0, 300));
+  // Groq uses OpenAI response format
+  const raw = response.data?.choices?.[0]?.message?.content?.trim();
+  if (!raw) throw new Error('Empty response from Groq API');
+  console.log('Groq raw:', raw.substring(0, 300));
 
   // Extract JSON even if Gemini wraps it in markdown fences
   const match = raw.match(/\{[\s\S]*\}/);
