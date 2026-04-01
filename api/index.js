@@ -10,7 +10,7 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // Gemini REST endpoint — avoids SDK fetch issues in serverless environments
 const GEMINI_URL =
-  `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 // chatId → { rows: [], processing: number, albumTimeouts: Map }
