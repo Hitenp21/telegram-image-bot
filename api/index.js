@@ -6,208 +6,340 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
+// ─── Init ─────────────────────────────────────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); // Recommended for vision + speed
+const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
-const userData = new Map(); // chatId -> array of extracted items
-const mediaGroupTimeouts = new Map();
+// ─── State ────────────────────────────────────────────────────────────────────
+// chatId → { rows: [], processing: number, albumTimeouts: Map }
+const sessions = new Map();
 
-// Powerful prompt for bills with multiple items
-const BILL_EXTRACTION_PROMPT = `
-You are an expert at extracting data from bills, invoices, receipts, or shopping lists.
+function getSession(chatId) {
+  if (!sessions.has(chatId)) {
+    sessions.set(chatId, { rows: [], processing: 0, albumTimeouts: new Map() });
+  }
+  return sessions.get(chatId);
+}
 
-Analyze the image carefully and extract:
+function clearSession(chatId) {
+  sessions.delete(chatId);
+}
 
-- billDate: The date of the bill/invoice (in YYYY-MM-DD format if possible, or as written)
-- userName: Customer name, buyer name, or shop/customer identifier (if not found, use "N/A")
-- items: Array of all products/line items. For each item extract:
-  - productName: Full name of the product/item
-  - rate: Price per unit (number only, remove currency)
-  - quantity: Quantity (number). If not mentioned, assume 1.
+// ─── Gemini Prompt ─────────────────────────────────────────────────────────────
+const BILL_PROMPT = `
+You are an expert OCR engine specialized in bills, invoices, receipts, and shopping lists.
 
-Return ONLY a valid JSON object in this exact structure, nothing else:
+Carefully analyze the image and extract:
+
+- billDate  : Date on the bill (YYYY-MM-DD preferred; use original format if unclear)
+- userName  : Customer name, buyer name, or "N/A" if absent
+- items     : Array of every product/line-item found. For each extract:
+    - productName : Full name of the product/item
+    - rate        : Price per unit (number only, no currency symbol)
+    - quantity    : Quantity ordered (number; default 1 if not shown)
+
+Return ONLY a single valid JSON object — no markdown, no explanation, no extra text.
 
 {
-  "billDate": "2025-12-25",
-  "userName": "Hiten Patel",
+  "billDate": "2025-06-15",
+  "userName": "Rahul Shah",
   "items": [
-    {
-      "productName": "Wireless Headphones",
-      "rate": 1299,
-      "quantity": 1
-    },
-    {
-      "productName": "Mobile Charger",
-      "rate": 399,
-      "quantity": 2
-    }
+    { "productName": "Basmati Rice 5kg",  "rate": 425,  "quantity": 2 },
+    { "productName": "Toor Dal 1kg",       "rate": 145,  "quantity": 3 }
   ]
 }
 
-If any value is missing or unclear, use null or "N/A" for strings, and 0 or 1 for numbers. Do not add explanations.
+Rules:
+- Use null for any value that is genuinely missing.
+- If a product has no separate rate/quantity, estimate from total if visible.
+- Never invent data; if unclear write "N/A" for strings and 0 for numbers.
 `;
 
-async function downloadImage(fileId) {
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Detect MIME type from Telegram file_path extension */
+function getMimeType(filePath) {
+  const ext = (filePath || '').split('.').pop().toLowerCase();
+  const map = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
+  return map[ext] || 'image/jpeg';
+}
+
+/** Download a Telegram file as a Buffer */
+async function downloadTelegramFile(fileId) {
   const file = await bot.telegram.getFile(fileId);
-  const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
-  const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
-  return Buffer.from(response.data);
+  const url = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
+  const response = await axios.get(url, { responseType: 'arraybuffer' });
+  return { buffer: Buffer.from(response.data), filePath: file.file_path };
 }
 
-async function extractDataFromImage(imageBuffer) {
-  try {
-    const imagePart = {
-      inlineData: {
-        data: imageBuffer.toString('base64'),
-        mimeType: 'image/jpeg',
-      },
-    };
+/** Send image buffer to Gemini and extract structured bill data */
+async function extractFromImage(buffer, filePath) {
+  const mimeType = getMimeType(filePath);
 
-    const result = await model.generateContent([BILL_EXTRACTION_PROMPT, imagePart]);
-    const text = result.response.text().trim();
+  const imagePart = {
+    inlineData: {
+      data: buffer.toString('base64'),
+      mimeType,
+    },
+  };
 
-    // Extract JSON part safely
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
+  const result = await model.generateContent([BILL_PROMPT, imagePart]);
+  const raw = result.response.text().trim();
 
-      const billDate = parsed.billDate || 'N/A';
-      const userName = parsed.userName || 'N/A';
+  // Safely pull out JSON even if Gemini wraps it in markdown
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('No JSON found in Gemini response');
 
-      const items = Array.isArray(parsed.items) ? parsed.items : [];
+  const parsed = JSON.parse(match[0]);
+  const billDate = parsed.billDate || 'N/A';
+  const userName = parsed.userName || 'N/A';
+  const items = Array.isArray(parsed.items) ? parsed.items : [];
 
-      // Convert items into flat rows with billDate and userName repeated
-      return items.map(item => ({
-        billDate: billDate,
-        userName: userName,
-        productName: item.productName || 'N/A',
-        rate: Number(item.rate) || 0,
-        quantity: Number(item.quantity) || 1,
-      }));
-    }
-    return [];
-  } catch (error) {
-    console.error('Gemini Extraction Error:', error.message);
-    return [];
-  }
+  return items.map(item => ({
+    billDate,
+    userName,
+    productName: item.productName || 'N/A',
+    rate:        isNaN(Number(item.rate))     ? 0 : Number(item.rate),
+    quantity:    isNaN(Number(item.quantity)) ? 1 : Number(item.quantity),
+    amount:      0, // computed below
+  })).map(row => ({ ...row, amount: +(row.rate * row.quantity).toFixed(2) }));
 }
 
-async function generateExcel(dataArray, chatId) {
-  const workbook = new ExcelJS.Workbook();
-  const worksheet = workbook.addWorksheet('Bill Extraction');
+/** Build a styled Excel workbook from accumulated rows */
+async function buildExcel(rows, chatId) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'BillBot';
+  wb.created = new Date();
 
-  worksheet.columns = [
-    { header: 'Bill Date', key: 'billDate', width: 15 },
-    { header: 'User Name', key: 'userName', width: 25 },
-    { header: 'Product Name', key: 'productName', width: 35 },
-    { header: 'Rate', key: 'rate', width: 15 },
-    { header: 'Quantity', key: 'quantity', width: 12 },
+  const ws = wb.addWorksheet('Bills', { views: [{ state: 'frozen', ySplit: 1 }] });
+
+  // Column definitions
+  ws.columns = [
+    { header: 'Bill Date',    key: 'billDate',     width: 14 },
+    { header: 'Customer',     key: 'userName',     width: 22 },
+    { header: 'Product Name', key: 'productName',  width: 38 },
+    { header: 'Rate (₹)',     key: 'rate',         width: 13 },
+    { header: 'Qty',          key: 'quantity',     width: 8  },
+    { header: 'Amount (₹)',   key: 'amount',       width: 15 },
   ];
 
-  // Add all rows (multiple products per bill)
-  worksheet.addRows(dataArray);
+  // ── Header row styling ──────────────────────────────────────────────────────
+  const headerRow = ws.getRow(1);
+  headerRow.eachCell(cell => {
+    cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A3C5E' } };
+    cell.font   = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11, name: 'Calibri' };
+    cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+    cell.border = {
+      top:    { style: 'thin', color: { argb: 'FF0D2137' } },
+      bottom: { style: 'thin', color: { argb: 'FF0D2137' } },
+      left:   { style: 'thin', color: { argb: 'FF0D2137' } },
+      right:  { style: 'thin', color: { argb: 'FF0D2137' } },
+    };
+  });
+  headerRow.height = 22;
 
-  // Optional: Add total row at bottom
-  if (dataArray.length > 0) {
-    const totalAmount = dataArray.reduce((sum, row) => sum + (row.rate * row.quantity), 0);
-    worksheet.addRow({
-      billDate: '',
-      userName: '',
-      productName: 'TOTAL AMOUNT',
-      rate: totalAmount,
-      quantity: ''
+  // ── Data rows ───────────────────────────────────────────────────────────────
+  rows.forEach((row, i) => {
+    const dataRow = ws.addRow(row);
+    const isEven = i % 2 === 0;
+    const bgColor = isEven ? 'FFEEF3F8' : 'FFFFFFFF';
+
+    dataRow.eachCell({ includeEmpty: true }, (cell, colNum) => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgColor } };
+      cell.font = { name: 'Calibri', size: 10 };
+      cell.border = {
+        top:    { style: 'hair', color: { argb: 'FFCCCCCC' } },
+        bottom: { style: 'hair', color: { argb: 'FFCCCCCC' } },
+        left:   { style: 'hair', color: { argb: 'FFCCCCCC' } },
+        right:  { style: 'hair', color: { argb: 'FFCCCCCC' } },
+      };
+
+      // Align numeric columns right
+      if ([4, 5, 6].includes(colNum)) {
+        cell.alignment = { horizontal: 'right' };
+        if (colNum === 5) cell.alignment = { horizontal: 'center' }; // Qty centered
+      } else {
+        cell.alignment = { horizontal: 'left', wrapText: true };
+      }
     });
-  }
+    dataRow.height = 18;
+  });
 
-  const filePath = path.join('/tmp', `bill_${chatId}_${Date.now()}.xlsx`);
-  await workbook.xlsx.writeFile(filePath);
+  // ── Grand Total row ─────────────────────────────────────────────────────────
+  const grandTotal = rows.reduce((s, r) => s + r.amount, 0);
+  const totalRow = ws.addRow({
+    billDate:    '',
+    userName:    '',
+    productName: 'GRAND TOTAL',
+    rate:        '',
+    quantity:    '',
+    amount:      +grandTotal.toFixed(2),
+  });
+
+  totalRow.eachCell({ includeEmpty: true }, (cell, colNum) => {
+    cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A3C5E' } };
+    cell.font   = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11, name: 'Calibri' };
+    cell.border = {
+      top:    { style: 'medium', color: { argb: 'FF0D2137' } },
+      bottom: { style: 'medium', color: { argb: 'FF0D2137' } },
+      left:   { style: 'thin',   color: { argb: 'FF0D2137' } },
+      right:  { style: 'thin',   color: { argb: 'FF0D2137' } },
+    };
+    if (colNum === 3) cell.alignment = { horizontal: 'right' };
+    if (colNum === 6) cell.alignment = { horizontal: 'right' };
+  });
+  totalRow.height = 22;
+
+  // ── Auto-filter ─────────────────────────────────────────────────────────────
+  ws.autoFilter = { from: 'A1', to: 'F1' };
+
+  // ── Write file ──────────────────────────────────────────────────────────────
+  const filePath = path.join('/tmp', `bills_${chatId}_${Date.now()}.xlsx`);
+  await wb.xlsx.writeFile(filePath);
   return filePath;
 }
 
-// --- BOT LOGIC (Start, Photo Handler, etc.) ---
-bot.start((ctx) => ctx.reply("Welcome! Send me a bill photo."));
+// ─── Bot Commands ──────────────────────────────────────────────────────────────
 
-// Photo handler
-bot.on('photo', async (ctx) => {
+bot.start(ctx => ctx.reply(
+  `👋 Welcome to *Bill Extractor Bot*!\n\n` +
+  `📸 Send me one or multiple bill photos.\n` +
+  `📊 Use /done to generate the Excel file.\n` +
+  `🗑 Use /clear to reset your session.\n` +
+  `📋 Use /status to see how many items are queued.`,
+  { parse_mode: 'Markdown' }
+));
+
+bot.command('status', ctx => {
+  const session = getSession(ctx.chat.id);
+  const count = session.rows.length;
+  if (count === 0) {
+    return ctx.reply('📭 No items queued yet. Send some bill photos!');
+  }
+  const bills = [...new Set(session.rows.map(r => r.billDate))];
+  ctx.reply(
+    `📋 *Session Status*\n\n` +
+    `🧾 Items extracted : ${count}\n` +
+    `📅 Bill dates      : ${bills.join(', ')}\n\n` +
+    `Send /done to generate your Excel file.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.command('clear', ctx => {
+  clearSession(ctx.chat.id);
+  ctx.reply('🗑 Session cleared. You can start fresh by sending new bill photos.');
+});
+
+bot.command('done', async ctx => {
   const chatId = ctx.chat.id;
-  const message = ctx.message;
-  const photo = message.photo[message.photo.length - 1]; // best quality
-  const mediaGroupId = message.media_group_id;
+  const session = getSession(chatId);
 
-  if (!userData.has(chatId)) {
-    userData.set(chatId, []);
+  if (session.processing > 0) {
+    return ctx.reply(`⏳ Still processing ${session.processing} image(s). Please wait and try /done again.`);
+  }
+  if (session.rows.length === 0) {
+    return ctx.reply('📭 No data extracted yet. Please send bill photos first.');
   }
 
-  await ctx.reply('📸 Processing bill image with Gemini...');
-
+  await ctx.reply('📊 Generating your Excel file...');
   try {
-    const imageBuffer = await downloadImage(photo.file_id);
-    const extractedRows = await extractDataFromImage(imageBuffer);
-
-    if (extractedRows.length > 0) {
-      userData.get(chatId).push(...extractedRows);
-      await ctx.reply(`✅ Extracted ${extractedRows.length} product(s) from this bill.`);
-    } else {
-      await ctx.reply('⚠️ Could not extract clear data. Try sending a clearer image of the bill.');
-    }
-
-    // Media group (album) handling
-    if (mediaGroupId) {
-      if (!mediaGroupTimeouts.has(mediaGroupId)) {
-        mediaGroupTimeouts.set(mediaGroupId, setTimeout(async () => {
-          const allRows = userData.get(chatId) || [];
-          if (allRows.length > 0) {
-            const filePath = await generateExcel(allRows, chatId);
-            await ctx.replyWithDocument({ 
-              source: filePath, 
-              filename: `bill_extraction_${Date.now()}.xlsx` 
-            });
-            fs.unlinkSync(filePath);
-            userData.delete(chatId);
-          }
-          mediaGroupTimeouts.delete(mediaGroupId);
-        }, 3000)); // 3 seconds for albums
-      }
-    } else {
-      // Single image → send Excel immediately
-      const allRows = userData.get(chatId);
-      if (allRows.length > 0) {
-        const filePath = await generateExcel(allRows, chatId);
-        await ctx.replyWithDocument({ 
-          source: filePath, 
-          filename: `bill_extraction_${Date.now()}.xlsx` 
-        });
-        fs.unlinkSync(filePath);
-        userData.delete(chatId);
-      }
-    }
-
+    const filePath = await buildExcel(session.rows, chatId);
+    await ctx.replyWithDocument(
+      { source: filePath, filename: `bills_${Date.now()}.xlsx` },
+      { caption: `✅ *${session.rows.length} item(s)* extracted from your bills.\nUse /clear to start a new session.`, parse_mode: 'Markdown' }
+    );
+    fs.unlinkSync(filePath);
+    clearSession(chatId);
   } catch (err) {
-    console.error(err);
-    await ctx.reply('❌ Error while processing. Please try again with a clearer photo.');
+    console.error('Excel generation error:', err);
+    ctx.reply('❌ Failed to generate Excel. Please try /done again.');
   }
 });
 
-// --- VERCEL ADAPTER ---
-// Instead of bot.launch(), we export a function that Vercel calls
-module.exports = async (req, res) => {
-  // 1. THIS LOG MUST APPEAR IF TELEGRAM HITS YOUR SERVER
-  console.log("--- INCOMING UPDATE RECEIVED ---");
-  console.log("Method:", req.method);
-  console.log("Body:", JSON.stringify(req.body));
+// ─── Photo Handler ─────────────────────────────────────────────────────────────
 
+bot.on('photo', async ctx => {
+  const chatId       = ctx.chat.id;
+  const message      = ctx.message;
+  const photo        = message.photo[message.photo.length - 1]; // highest resolution
+  const mediaGroupId = message.media_group_id;
+  const session      = getSession(chatId);
+
+  session.processing += 1;
+
+  // Acknowledge only once per album (first image)
+  if (!mediaGroupId || !session.albumTimeouts.has(mediaGroupId)) {
+    await ctx.reply('📸 Received! Extracting bill data with Gemini AI…');
+  }
+
+  (async () => {
+    try {
+      const { buffer, filePath } = await downloadTelegramFile(photo.file_id);
+      const rows = await extractFromImage(buffer, filePath);
+
+      if (rows.length > 0) {
+        session.rows.push(...rows);
+        await ctx.reply(`✅ Extracted *${rows.length}* product(s). Total queued: *${session.rows.length}*\n\nSend more photos or type /done to get Excel.`, { parse_mode: 'Markdown' });
+      } else {
+        await ctx.reply('⚠️ Could not find items in this image. Try a clearer photo of the bill.');
+      }
+    } catch (err) {
+      console.error('Image processing error:', err.message);
+      await ctx.reply('❌ Error processing this image. Please resend a clearer photo.');
+    } finally {
+      session.processing -= 1;
+    }
+
+    // ── Album: auto-send Excel after all images processed ──────────────────
+    if (mediaGroupId) {
+      // Reset debounce timer on each new album image
+      if (session.albumTimeouts.has(mediaGroupId)) {
+        clearTimeout(session.albumTimeouts.get(mediaGroupId));
+      }
+
+      session.albumTimeouts.set(mediaGroupId, setTimeout(async () => {
+        // Wait until all parallel processing is done
+        const waitForProcessing = () => new Promise(resolve => {
+          const check = setInterval(() => {
+            if (session.processing === 0) { clearInterval(check); resolve(); }
+          }, 300);
+        });
+        await waitForProcessing();
+
+        session.albumTimeouts.delete(mediaGroupId);
+
+        if (session.rows.length > 0) {
+          await ctx.reply('📊 Album complete! Generating Excel…');
+          try {
+            const filePath = await buildExcel(session.rows, chatId);
+            await ctx.replyWithDocument(
+              { source: filePath, filename: `bills_${Date.now()}.xlsx` },
+              { caption: `✅ *${session.rows.length} item(s)* from your album.\nUse /clear to start fresh.`, parse_mode: 'Markdown' }
+            );
+            fs.unlinkSync(filePath);
+            clearSession(chatId);
+          } catch (err) {
+            console.error('Album Excel error:', err);
+            await ctx.reply('❌ Failed to generate Excel. Try /done manually.');
+          }
+        }
+      }, 4000)); // 4 s debounce for album grouping
+    }
+  })();
+});
+
+// ─── Vercel Webhook Adapter ────────────────────────────────────────────────────
+module.exports = async (req, res) => {
   try {
     if (req.method === 'POST') {
-      // Ensure the bot processes the update
       await bot.handleUpdate(req.body);
       return res.status(200).send('OK');
     }
-    
-    // Fallback for browser testing
-    res.status(200).send('Bot is running and waiting for POST...');
+    res.status(200).send('Bill Extractor Bot is running ✅');
   } catch (err) {
-    console.error("CRITICAL ERROR:", err.message);
-    res.status(500).send('Bot Error');
+    console.error('Webhook error:', err.message);
+    res.status(500).send('Internal Error');
   }
 };
