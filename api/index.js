@@ -10,7 +10,7 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // Gemini REST endpoint — avoids SDK fetch issues in serverless environments
 const GEMINI_URL =
-  `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 // chatId → { rows: [], processing: number, albumTimeouts: Map }
@@ -99,17 +99,33 @@ async function extractFromImage(buffer, filePath) {
     },
   };
 
+  // Retry up to 3 times on 429 (rate limit), with delay from Retry-After header
   let response;
-  try {
-    response = await axios.post(GEMINI_URL, requestBody, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 60000,  // 60 s for large bill images
-    });
-  } catch (apiErr) {
-    // Log the full Gemini error body so you can diagnose API issues
-    const status = apiErr?.response?.status;
-    const body   = JSON.stringify(apiErr?.response?.data || apiErr.message);
-    throw new Error(`Gemini API ${status}: ${body}`);
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      response = await axios.post(GEMINI_URL, requestBody, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 60000,
+      });
+      break; // success — exit retry loop
+    } catch (apiErr) {
+      const status = apiErr?.response?.status;
+      const errBody = apiErr?.response?.data?.error;
+
+      if (status === 429 && attempt < MAX_RETRIES) {
+        // Parse retry delay from Gemini error details (e.g. "15s")
+        const retryDetail = errBody?.details?.find(d => d['@type']?.includes('RetryInfo'));
+        const delaySecs   = parseInt(retryDetail?.retryDelay) || (attempt * 15);
+        console.log(`Gemini 429 — waiting ${delaySecs}s before retry ${attempt}/${MAX_RETRIES}`);
+        await new Promise(r => setTimeout(r, delaySecs * 1000));
+        continue;
+      }
+
+      // Non-429 or out of retries — throw with full detail
+      const body = JSON.stringify(errBody || apiErr.message);
+      throw new Error(`Gemini API ${status}: ${body}`);
+    }
   }
 
   // Navigate the Gemini REST response structure
