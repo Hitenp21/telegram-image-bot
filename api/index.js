@@ -192,15 +192,22 @@ bot.on('photo', async (ctx) => {
 // --- VERCEL ADAPTER ---
 // Instead of bot.launch(), we export a function that Vercel calls
 module.exports = async (req, res) => {
-    try {
-        if (req.method === 'POST') {
-            await bot.handleUpdate(req.body);
-            res.status(200).send('OK');
-        } else {
-            res.status(200).send('Bot is running...');
-        }
-    } catch (err) {
-        console.error("Vercel Handler Error:", err);
-        res.status(500).send('Error');
+  // 1. THIS LOG MUST APPEAR IF TELEGRAM HITS YOUR SERVER
+  console.log("--- INCOMING UPDATE RECEIVED ---");
+  console.log("Method:", req.method);
+  console.log("Body:", JSON.stringify(req.body));
+
+  try {
+    if (req.method === 'POST') {
+      // Ensure the bot processes the update
+      await bot.handleUpdate(req.body);
+      return res.status(200).send('OK');
     }
+    
+    // Fallback for browser testing
+    res.status(200).send('Bot is running and waiting for POST...');
+  } catch (err) {
+    console.error("CRITICAL ERROR:", err.message);
+    res.status(500).send('Bot Error');
+  }
 };
