@@ -1,8 +1,16 @@
 {
+  "name": "bill-extractor-bot",
+  "version": "2.0.0",
+  "description": "Telegram bot to extract bill data using Gemini AI and export to Excel",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node -e \"require('dotenv').config(); const {Telegraf}=require('telegraf'); const bot=require('./bot.js'); bot.launch ? bot.launch() : console.log('Use webhook mode');\"",
+    "polling": "node polling.js"
+  },
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
-    "axios": "^1.14.0",
-    "dotenv": "^17.3.1",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
     "exceljs": "^4.4.0",
     "telegraf": "^4.16.3"
   }

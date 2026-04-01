@@ -1,6 +1,5 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const ExcelJS = require('exceljs');
 const axios = require('axios');
 const fs = require('fs');
@@ -8,8 +7,10 @@ const path = require('path');
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+// Gemini REST endpoint — avoids SDK fetch issues in serverless environments
+const GEMINI_URL =
+  `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 // chatId → { rows: [], processing: number, albumTimeouts: Map }
@@ -73,21 +74,42 @@ async function downloadTelegramFile(fileId) {
   return { buffer: Buffer.from(response.data), filePath: file.file_path };
 }
 
-/** Send image buffer to Gemini and extract structured bill data */
+/** Send image buffer to Gemini REST API and extract structured bill data */
 async function extractFromImage(buffer, filePath) {
   const mimeType = getMimeType(filePath);
 
-  const imagePart = {
-    inlineData: {
-      data: buffer.toString('base64'),
-      mimeType,
+  // Build REST request body — avoids SDK fetch issues in serverless environments
+  const requestBody = {
+    contents: [
+      {
+        parts: [
+          { text: BILL_PROMPT },
+          {
+            inline_data: {
+              mime_type: mimeType,
+              data: buffer.toString('base64'),
+            },
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.1,      // low temp = deterministic JSON
+      maxOutputTokens: 2048,
     },
   };
 
-  const result = await model.generateContent([BILL_PROMPT, imagePart]);
-  const raw = result.response.text().trim();
+  const response = await axios.post(GEMINI_URL, requestBody, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 60000,  // 60 s for large bill images
+  });
 
-  // Safely pull out JSON even if Gemini wraps it in markdown
+  // Navigate the Gemini REST response structure
+  const raw = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  if (!raw) throw new Error('Empty response from Gemini REST API');
+  console.log('Gemini raw:', raw.substring(0, 300));
+
+  // Extract JSON even if Gemini wraps it in markdown fences
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('No JSON found in Gemini response');
 
@@ -96,14 +118,18 @@ async function extractFromImage(buffer, filePath) {
   const userName = parsed.userName || 'N/A';
   const items = Array.isArray(parsed.items) ? parsed.items : [];
 
-  return items.map(item => ({
-    billDate,
-    userName,
-    productName: item.productName || 'N/A',
-    rate:        isNaN(Number(item.rate))     ? 0 : Number(item.rate),
-    quantity:    isNaN(Number(item.quantity)) ? 1 : Number(item.quantity),
-    amount:      0, // computed below
-  })).map(row => ({ ...row, amount: +(row.rate * row.quantity).toFixed(2) }));
+  return items.map(item => {
+    const rate     = isNaN(Number(item.rate))     ? 0 : Number(item.rate);
+    const quantity = isNaN(Number(item.quantity)) ? 1 : Number(item.quantity);
+    return {
+      billDate,
+      userName,
+      productName: item.productName || 'N/A',
+      rate,
+      quantity,
+      amount: +(rate * quantity).toFixed(2),
+    };
+  });
 }
 
 /** Build a styled Excel workbook from accumulated rows */
